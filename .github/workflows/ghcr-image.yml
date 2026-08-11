@@ -40,6 +40,9 @@ jobs:
         working-directory: backend
         run: go vet ./...
 
+      - name: Test quality guard
+        run: python3 -m unittest -v tools/egress-quality-guard/quality_guard_test.py tools/egress-quality-guard/session_rotator_test.py
+
       - name: Verify Swagger document
         run: |
           make swagger
@@ -70,7 +73,7 @@ jobs:
         run: pnpm build
 
   check_ghcr_image:
-    name: Build image (${{ matrix.arch }})
+    name: Build ${{ matrix.component }} (${{ matrix.arch }})
     if: github.event_name != 'push'
     needs: verify
     strategy:
@@ -80,9 +83,27 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
+            component: app
+            dockerfile: ./Dockerfile
+            cache_scope: app-amd64
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+            component: app
+            dockerfile: ./Dockerfile
+            cache_scope: app-arm64
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            component: quality-guard
+            dockerfile: ./tools/egress-quality-guard/Dockerfile
+            cache_scope: quality-guard-amd64
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            component: quality-guard
+            dockerfile: ./tools/egress-quality-guard/Dockerfile
+            cache_scope: quality-guard-arm64
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -96,15 +117,15 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           push: false
-          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
           provenance: false
           sbom: false
 
   build_ghcr_image:
-    name: Publish image (${{ matrix.arch }})
+    name: Publish ${{ matrix.component }} (${{ matrix.arch }})
     if: github.event_name == 'push'
     needs: verify
     permissions:
@@ -117,9 +138,31 @@ jobs:
           - arch: amd64
             platform: linux/amd64
             runner: ubuntu-24.04
+            component: app
+            dockerfile: ./Dockerfile
+            cache_scope: app-amd64
+            image_suffix: ""
           - arch: arm64
             platform: linux/arm64
             runner: ubuntu-24.04-arm
+            component: app
+            dockerfile: ./Dockerfile
+            cache_scope: app-arm64
+            image_suffix: ""
+          - arch: amd64
+            platform: linux/amd64
+            runner: ubuntu-24.04
+            component: quality-guard
+            dockerfile: ./tools/egress-quality-guard/Dockerfile
+            cache_scope: quality-guard-amd64
+            image_suffix: "-quality-guard"
+          - arch: arm64
+            platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            component: quality-guard
+            dockerfile: ./tools/egress-quality-guard/Dockerfile
+            cache_scope: quality-guard-arm64
+            image_suffix: "-quality-guard"
     runs-on: ${{ matrix.runner }}
 
     steps:
@@ -133,7 +176,7 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image_name=$(printf '%s%s' "$GITHUB_REPOSITORY" "${{ matrix.image_suffix }}" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata
@@ -157,18 +200,18 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./Dockerfile
+          file: ${{ matrix.dockerfile }}
           platforms: ${{ matrix.platform }}
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.arch }}
-          cache-to: type=gha,scope=${{ matrix.arch }},mode=max
+          cache-from: type=gha,scope=${{ matrix.cache_scope }}
+          cache-to: type=gha,scope=${{ matrix.cache_scope }},mode=max
           provenance: mode=max
           sbom: true
 
   merge:
-    name: Merge image
+    name: Merge ${{ matrix.component }}
     if: github.event_name == 'push'
     needs:
       - build_ghcr_image
@@ -176,6 +219,14 @@ jobs:
     permissions:
       contents: read
       packages: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - component: app
+            image_suffix: ""
+          - component: quality-guard
+            image_suffix: "-quality-guard"
 
     steps:
       - name: Set up Buildx
@@ -185,7 +236,7 @@ jobs:
         id: image
         shell: bash
         run: |
-          image_name=$(printf '%s' "$GITHUB_REPOSITORY" | tr '[:upper:]' '[:lower:]')
+          image_name=$(printf '%s%s' "$GITHUB_REPOSITORY" "${{ matrix.image_suffix }}" | tr '[:upper:]' '[:lower:]')
           echo "name=ghcr.io/$image_name" >> "$GITHUB_OUTPUT"
 
       - name: Docker metadata

@@ -1,0 +1,73 @@
+name: grok2api
+
+services:
+  grok2api:
+    container_name: grok2api
+    image: "${GROK2API_IMAGE:-ghcr.io/starhosea/grok2api:latest}"
+    ports:
+      # 仅暴露到本机回环，由宿主 OpenResty(host 网络) 反代
+      - "127.0.0.1:8000:8000"
+    environment:
+      TZ: "Asia/Shanghai"
+      GROK2API_QUALITY_GUARD_DIR: /var/lib/grok2api-quality-guard
+    volumes:
+      - "./config.yaml:/run/grok2api/config.yaml:ro"
+      - grok2api-data:/app/data
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+    depends_on:
+      - warp
+    networks:
+      - default
+      - ai-services
+
+  # 防封：WARP 作为干净落地出口，grok2api 出口节点填 socks5h://warp:1080
+  warp:
+    container_name: grok2api-warp
+    image: caomingjun/warp:latest
+    restart: unless-stopped
+    environment:
+      - WARP_SLEEP=2
+    cap_add:
+      - NET_ADMIN
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=0
+      - net.ipv4.conf.all.src_valid_mark=1
+    volumes:
+      - warp-data:/var/lib/cloudflare-warp
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS https://www.cloudflare.com/cdn-cgi/trace | grep -q 'warp=on' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+
+  # Grok Build 出口质量守护 sidecar（COMPOSE_PROFILES=quality-guard 时启动）
+  egress-quality-guard:
+    container_name: grok2api-egress-quality-guard
+    profiles: ["quality-guard"]
+    image: "${GROK2API_QUALITY_GUARD_IMAGE:-ghcr.io/starhosea/grok2api-quality-guard:latest}"
+    depends_on:
+      grok2api:
+        condition: service_healthy
+    volumes:
+      - quality_guard_state:/var/lib/grok2api-quality-guard
+    restart: "on-failure:5"
+    init: true
+    stop_grace_period: 30s
+    security_opt:
+      - no-new-privileges:true
+
+volumes:
+  grok2api-data:
+  warp-data:
+  quality_guard_state:
+
+networks:
+  ai-services:
+    external: true
+    name: ai-services

@@ -20,6 +20,21 @@ jobs:
     if: ${{ github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
     steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Sync deploy assets
+        uses: appleboy/scp-action@v0.1.7
+        with:
+          host: ${{ secrets.DEPLOY_SSH_HOST }}
+          username: ${{ secrets.DEPLOY_SSH_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
+          source: "scripts/deploy.sh,scripts/enable-quality-guard-config.sh,deploy/docker-compose.yml"
+          target: ${{ secrets.DEPLOY_PATH }}
+          strip_components: 0
+          overwrite: true
+
       - name: SSH and deploy
         uses: appleboy/ssh-action@v1.2.0
         env:
@@ -37,4 +52,8 @@ jobs:
             echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
             cd ${{ secrets.DEPLOY_PATH }}
+            mkdir -p scripts
+            chmod 755 scripts/deploy.sh scripts/enable-quality-guard-config.sh
+            cp deploy/docker-compose.yml docker-compose.yml
+            bash scripts/enable-quality-guard-config.sh
             bash scripts/deploy.sh
