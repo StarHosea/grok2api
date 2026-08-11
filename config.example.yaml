@@ -36,6 +36,9 @@ bootstrapAdmin:
   password: "replace-with-a-strong-password"
 
 frontend:
+  # [按需修改] 生成图片/视频公开 URL 与文档示例地址；生产请填公网 HTTPS 域名。
+  # 留空时默认为 http://127.0.0.1:8000。
+  publicApiBaseURL: "http://127.0.0.1:8000"
   # [通常不要修改] Go 服务同源托管的前端构建目录。
   staticPath: "./frontend/dist"
 

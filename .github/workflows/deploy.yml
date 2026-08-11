@@ -30,7 +30,7 @@ jobs:
           username: ${{ secrets.DEPLOY_SSH_USER }}
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_SSH_PORT || 22 }}
-          source: "scripts/deploy.sh,scripts/enable-quality-guard-config.sh,deploy/docker-compose.yml"
+          source: "scripts/deploy.sh,scripts/ensure-production-config.sh,deploy/docker-compose.yml"
           target: ${{ secrets.DEPLOY_PATH }}
           strip_components: 0
           overwrite: true
@@ -53,7 +53,7 @@ jobs:
             trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
             cd ${{ secrets.DEPLOY_PATH }}
             mkdir -p scripts
-            chmod 755 scripts/deploy.sh scripts/enable-quality-guard-config.sh
+            chmod 755 scripts/deploy.sh scripts/ensure-production-config.sh
             cp deploy/docker-compose.yml docker-compose.yml
-            bash scripts/enable-quality-guard-config.sh
+            bash scripts/ensure-production-config.sh
             bash scripts/deploy.sh
