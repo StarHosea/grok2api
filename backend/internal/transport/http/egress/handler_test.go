@@ -2,6 +2,7 @@ package egress
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"net/http/httptest"
@@ -13,13 +14,150 @@ import (
 	"time"
 
 	egressapp "github.com/chenyme/grok2api/backend/internal/application/egress"
+	accountdomain "github.com/chenyme/grok2api/backend/internal/domain/account"
 	egressdomain "github.com/chenyme/grok2api/backend/internal/domain/egress"
+	"github.com/chenyme/grok2api/backend/internal/infra/security"
+	"github.com/chenyme/grok2api/backend/internal/repository"
 	"github.com/gin-gonic/gin"
 )
 
+func TestQualityLeaseCursorRoundTripAndValidation(t *testing.T) {
+	want := accountdomain.EgressLeaseBlock{
+		AccountID:     42,
+		NodeID:        9,
+		CooldownUntil: time.Date(2026, time.August, 19, 8, 7, 6, 123456789, time.UTC),
+	}
+	encoded := encodeQualityLeaseCursor(want)
+	got, err := decodeQualityLeaseCursor(encoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.AccountID != want.AccountID || got.NodeID != want.NodeID || !got.CooldownUntil.Equal(want.CooldownUntil) {
+		t.Fatalf("cursor = %#v, want %#v", got, want)
+	}
+	for _, raw := range []string{
+		"not-base64",
+		"eyJ0IjoxLCJhIjowLCJuIjoxfQ",
+		"eyJ0IjoxLCJhIjoxLCJuIjoxfXsic2Vjb25kIjp0cnVlfQ",
+	} {
+		if _, err := decodeQualityLeaseCursor(raw); err == nil {
+			t.Fatalf("decodeQualityLeaseCursor(%q) succeeded", raw)
+		}
+	}
+}
+
+type proxyRevealRepository struct {
+	node        egressdomain.Node
+	profile     egressdomain.ProxyProfile
+	profilePage repository.PageQuery
+}
+
+func (r *proxyRevealRepository) ListEgressNodes(context.Context, egressdomain.Scope, repository.SortQuery) ([]egressdomain.Node, error) {
+	return []egressdomain.Node{r.node}, nil
+}
+func (r *proxyRevealRepository) ListEgressNodePage(context.Context, repository.EgressNodeListQuery) ([]egressdomain.Node, int64, error) {
+	return []egressdomain.Node{r.node}, 1, nil
+}
+func (r *proxyRevealRepository) GetEgressNode(_ context.Context, id uint64) (egressdomain.Node, error) {
+	if id != r.node.ID {
+		return egressdomain.Node{}, repository.ErrNotFound
+	}
+	return r.node, nil
+}
+func (r *proxyRevealRepository) CreateEgressNode(_ context.Context, value egressdomain.Node) (egressdomain.Node, error) {
+	return value, nil
+}
+func (r *proxyRevealRepository) UpdateEgressNode(_ context.Context, value egressdomain.Node) (egressdomain.Node, error) {
+	return value, nil
+}
+func (r *proxyRevealRepository) DeleteEgressNode(context.Context, uint64) error { return nil }
+func (r *proxyRevealRepository) ListEgressProxyProfiles(_ context.Context, page repository.PageQuery) ([]egressdomain.ProxyProfile, int64, error) {
+	r.profilePage = page
+	return []egressdomain.ProxyProfile{r.profile}, 1, nil
+}
+func (r *proxyRevealRepository) GetEgressProxyProfile(_ context.Context, id uint64) (egressdomain.ProxyProfile, error) {
+	if id != r.profile.ID {
+		return egressdomain.ProxyProfile{}, repository.ErrNotFound
+	}
+	return r.profile, nil
+}
+func (r *proxyRevealRepository) CreateEgressProxyProfile(_ context.Context, value egressdomain.ProxyProfile) (egressdomain.ProxyProfile, error) {
+	return value, nil
+}
+func (r *proxyRevealRepository) UpdateEgressProxyProfile(_ context.Context, value egressdomain.ProxyProfile, _ bool) (egressdomain.ProxyProfile, []uint64, error) {
+	return value, nil, nil
+}
+func (r *proxyRevealRepository) DeleteEgressProxyProfile(context.Context, uint64) error { return nil }
+
+func TestProxyURLRevealIsExplicitAndNeverCacheable(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	proxyURL := "socks5h://user:secret@proxy.example:1080"
+	encrypted, err := cipher.Encrypt(proxyURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := egressapp.NewService(&proxyRevealRepository{node: egressdomain.Node{ID: 7, EncryptedProxyURL: encrypted}}, cipher, "")
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "id", Value: "7"}}
+	context.Request = httptest.NewRequest("POST", "/egress-nodes/7/proxy-url/reveal", nil)
+	NewHandler(service).proxyURL(context)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "secret") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Cache-Control") != "private, no-store" || recorder.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("reveal cache headers = %#v", recorder.Header())
+	}
+}
+
+func TestProxyProfileURLRevealIsExplicitAndNeverCacheable(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted, err := cipher.Encrypt("http://profile-user:profile-secret@proxy.example:8080")
+	if err != nil {
+		t.Fatal(err)
+	}
+	service := egressapp.NewService(&proxyRevealRepository{profile: egressdomain.ProxyProfile{ID: 9, EncryptedProxyURL: encrypted}}, cipher, "")
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Params = gin.Params{{Key: "id", Value: "9"}}
+	context.Request = httptest.NewRequest("POST", "/egress-proxy-profiles/9/proxy-url/reveal", nil)
+	NewHandler(service).proxyProfileURL(context)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), "profile-secret") {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if recorder.Header().Get("Cache-Control") != "private, no-store" || recorder.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("reveal cache headers = %#v", recorder.Header())
+	}
+}
+
+func TestProxyProfileListUsesBoundedPaginationAndSearch(t *testing.T) {
+	cipher, err := security.NewCipher("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=")
+	if err != nil {
+		t.Fatal(err)
+	}
+	repository := &proxyRevealRepository{profile: egressdomain.ProxyProfile{ID: 9, Name: "Tokyo", EncryptedProxyURL: "invalid-but-redacted"}}
+	service := egressapp.NewService(repository, cipher, "")
+	recorder := httptest.NewRecorder()
+	context, _ := gin.CreateTestContext(recorder)
+	context.Request = httptest.NewRequest("GET", "/egress-proxy-profiles?page=2&pageSize=5&search=tokyo", nil)
+	NewHandler(service).listProxyProfiles(context)
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"page":2`) || !strings.Contains(recorder.Body.String(), `"pageSize":5`) || !strings.Contains(recorder.Body.String(), `"total":1`) {
+		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
+	}
+	if repository.profilePage.Offset != 5 || repository.profilePage.Limit != 5 || repository.profilePage.Search != "tokyo" {
+		t.Fatalf("page query = %#v", repository.profilePage)
+	}
+}
+
 func TestQualityGuardStatusReadsOnlyPublicState(t *testing.T) {
 	path := t.TempDir() + "/state.json"
-	state := `{"version":1,"started_at":10,"updated_at":20,"last_active_cycle_at":15,"last_passive_poll_at":19,"password":"must-not-leak","guard":{"mode":"hybrid","model":"grok-4.5","client_key_id":"6","node_ids":["8"],"active_interval_seconds":1800,"passive_poll_seconds":5,"soft_tps":500,"hard_tps":1000,"consecutive_soft":2,"consecutive_errors":2,"quarantine_seconds":300,"min_healthy_nodes":3,"max_output_tokens":384,"fail_closed":true,"min_generation_ms":1234,"prompt":"private-probe-prompt","expected":"private-marker"},"protected_node_ids":["9"],"nodes":{"8":{"active_soft_strikes":0,"passive_soft_strikes":0,"error_strikes":0,"quarantined_until":0,"disabled_by_guard":false,"last_reason":"","last_probe_at":15,"last_observed_at":19,"last_source":"passive","last_classification":"healthy","last_output_tps":42.5,"last_output_tokens":100,"last_first_token_ms":900,"last_duration_ms":4000}},"statistics":{"started_at":11,"active":{"total":7,"healthy":6,"soft":1,"hard":0,"errors":0,"output_tokens":1400},"passive":{"total":9,"healthy":8,"soft":0,"hard":1,"errors":0,"output_tokens":1800},"actions":{"quarantined":1,"restored":0,"suppressed":0}}}`
+	state := `{"version":1,"started_at":10,"updated_at":20,"last_active_cycle_at":15,"last_passive_poll_at":19,"password":"must-not-leak","guard":{"mode":"hybrid","model":"grok-4.5","client_key_id":"6","node_ids":["8"],"active_interval_seconds":1800,"passive_poll_seconds":5,"soft_tps":500,"hard_tps":1000,"consecutive_soft":2,"consecutive_errors":2,"quarantine_seconds":300,"min_healthy_nodes":3,"max_output_tokens":384,"fail_closed":true,"min_generation_ms":1234,"prompt":"private-probe-prompt","expected":"private-marker"},"protected_node_ids":["9"],"nodes":{"8":{"observe_only":true,"observe_only_reason":"account_bound_proxy","active_soft_strikes":0,"passive_soft_strikes":0,"error_strikes":0,"quarantined_until":0,"disabled_by_guard":false,"last_reason":"","last_probe_at":15,"last_observed_at":19,"last_source":"passive","last_classification":"healthy","last_output_tps":42.5,"last_output_tokens":100,"last_first_token_ms":900,"last_duration_ms":4000}},"statistics":{"started_at":11,"active":{"total":7,"healthy":6,"soft":1,"hard":0,"errors":0,"output_tokens":1400},"passive":{"total":9,"healthy":8,"soft":0,"hard":1,"errors":0,"output_tokens":1800},"actions":{"quarantined":1,"restored":0,"suppressed":0}}}`
 	if err := os.WriteFile(path, []byte(state), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +165,7 @@ func TestQualityGuardStatusReadsOnlyPublicState(t *testing.T) {
 	context, _ := gin.CreateTestContext(recorder)
 	context.Request = httptest.NewRequest("GET", "/egress-quality-guard", nil)
 	NewHandler(nil, path).qualityGuardStatus(context)
-	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"available":true`) || !strings.Contains(recorder.Body.String(), `"last_output_tps":42.5`) || !strings.Contains(recorder.Body.String(), `"output_tokens":1400`) || !strings.Contains(recorder.Body.String(), `"protectedNodeIds":["9"]`) || !strings.Contains(recorder.Body.String(), `"fail_closed":true`) || !strings.Contains(recorder.Body.String(), `"min_generation_ms":1234`) {
+	if recorder.Code != 200 || !strings.Contains(recorder.Body.String(), `"available":true`) || !strings.Contains(recorder.Body.String(), `"observe_only":true`) || !strings.Contains(recorder.Body.String(), `"observe_only_reason":"account_bound_proxy"`) || !strings.Contains(recorder.Body.String(), `"last_output_tps":42.5`) || !strings.Contains(recorder.Body.String(), `"output_tokens":1400`) || !strings.Contains(recorder.Body.String(), `"protectedNodeIds":["9"]`) || !strings.Contains(recorder.Body.String(), `"fail_closed":true`) || !strings.Contains(recorder.Body.String(), `"min_generation_ms":1234`) {
 		t.Fatalf("status=%d body=%s", recorder.Code, recorder.Body.String())
 	}
 	if strings.Contains(recorder.Body.String(), "must-not-leak") || strings.Contains(recorder.Body.String(), "private-probe-prompt") || strings.Contains(recorder.Body.String(), "private-marker") || strings.Contains(recorder.Body.String(), "client_key_id") || !strings.Contains(recorder.Body.String(), `"recentEvents":[]`) {
